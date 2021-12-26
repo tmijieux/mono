@@ -24,6 +24,57 @@
 #include "utils/mono-logger-internals.h"
 
 #include "sgen-dynarray.h"
+#include "sgen/my_debug.h"
+
+
+mono_mutex_t my_debug_lock;
+mono_cond_t my_debug_bridge_cond; // only access with my_debug_lock
+mono_cond_t my_debug_job_cond; // only access with my_debug_lock
+volatile int my_debug_can_start_job = FALSE; // only access with my_debug_lock
+volatile int my_debug_can_leave_bridge = TRUE; // only access with my_debug_lock
+MonoGCBridgeCallbacks my_debug_callbacks;
+
+static MonoGCBridgeObjectKind my_debug_bridge_class_kind(MonoClass *klass)
+{
+    return GC_BRIDGE_TRANSPARENT_BRIDGE_CLASS;
+}
+
+static mono_bool my_debug_is_bridge_object(MonoObject *obj)
+{
+    (void)obj;
+    return TRUE;
+}
+
+static void my_debug_cross_references(
+    int num_sccs, MonoGCBridgeSCC **sccs,
+    int num_xrefs, MonoGCBridgeXRef *xrefs)
+{
+    for (int i = 0; i < num_sccs; ++i) {
+        sccs[i] ->is_alive = TRUE;
+    }
+}
+
+
+void my_debug_init(void)
+{
+    mono_os_mutex_init(&my_debug_lock);
+
+    mono_os_cond_init(&my_debug_job_cond);
+    my_debug_can_start_job = FALSE;
+
+    mono_os_cond_init(&my_debug_bridge_cond);
+    my_debug_can_leave_bridge = TRUE;
+    printf("my debug init!\n");
+
+    my_debug_callbacks.bridge_version = SGEN_BRIDGE_VERSION;
+    my_debug_callbacks.bridge_class_kind = my_debug_bridge_class_kind;
+    my_debug_callbacks.is_bridge_object = my_debug_is_bridge_object;
+    my_debug_callbacks.cross_references = my_debug_cross_references;
+
+    mono_gc_register_bridge_callbacks(&my_debug_callbacks);
+
+}
+
 
 /*
  * See comments in sgen-bridge.h
@@ -989,9 +1040,12 @@ processing_stw_step (void)
 	int i;
 	int bridge_count;
 	gint64 curtime;
+        printf("bridge stw enter !\n");
 
-	if (!dyn_array_ptr_size (&registered_bridges))
+	if (!dyn_array_ptr_size (&registered_bridges)) {
+                printf("left early ?!!?\n");
 		return;
+        }
 
 #if defined (DUMP_GRAPH)
 	printf ("-----------------\n");
@@ -1030,6 +1084,30 @@ processing_stw_step (void)
 
 	dump_color_table (" after tarjan", FALSE);
 #endif
+
+
+
+        int can_leave = 0;
+        mono_os_mutex_lock(&my_debug_lock);
+        do {
+            can_leave = my_debug_can_leave_bridge;
+            if (!can_leave)
+            {
+                if (!my_debug_can_start_job)
+                {
+                    my_debug_can_start_job = TRUE;
+                    printf("set can start job !\n");
+                }
+                printf("signaling job cond !\n");
+                mono_os_cond_broadcast(&my_debug_job_cond);
+
+                printf("waiting for bridge cond !\n");
+                mono_os_cond_wait(&my_debug_bridge_cond, &my_debug_lock);
+            }
+
+        } while (!can_leave);
+        printf("bridge left !\n");
+        mono_os_mutex_unlock(&my_debug_lock);
 
 	clear_after_processing ();
 }

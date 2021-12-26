@@ -179,6 +179,9 @@
 #include <stdlib.h>
 #include <glib.h>
 
+
+#include "mono/sgen/my_debug.h"
+
 #include "mono/sgen/sgen-gc.h"
 #include "mono/sgen/sgen-cardtable.h"
 #include "mono/sgen/sgen-protocol.h"
@@ -1582,6 +1585,20 @@ job_major_mod_union_preclean (void *worker_data_untyped, SgenThreadPoolJob *job)
 	ParallelScanJob *job_data = (ParallelScanJob*)job;
 	ScanCopyContext ctx = scan_copy_context_for_scan_job (worker_data_untyped, (ScanJob*)job_data);
 
+        int can_start = 0;
+        mono_os_mutex_lock(&my_debug_lock);
+        do {
+            can_start = my_debug_can_start_job;
+            if (!can_start)
+            {
+                printf("waiting for job_cond!\n");
+                mono_os_cond_wait(&my_debug_job_cond, &my_debug_lock);
+            }
+        } while (!can_start);
+        mono_os_mutex_unlock(&my_debug_lock);
+        printf("starting job_major_mod_union_preclean\n");
+
+
 	g_assert (sgen_concurrent_collection_in_progress);
 	SGEN_TV_GETTIME (atv);
 	sgen_major_collector.scan_card_table (CARDTABLE_SCAN_MOD_UNION_PRECLEAN, ctx, job_data->job_index, job_data->job_split_count, job_data->data);
@@ -1589,6 +1606,13 @@ job_major_mod_union_preclean (void *worker_data_untyped, SgenThreadPoolJob *job)
 
 	g_assert (worker_data_untyped);
 	((WorkerData*)worker_data_untyped)->major_scan_time += SGEN_TV_ELAPSED (atv, btv);
+
+
+        mono_os_mutex_lock(&my_debug_lock);
+        my_debug_can_leave_bridge = TRUE;
+        printf("signaling bridge_cond (can_leave=TRUE)\n");
+        mono_os_cond_broadcast(&my_debug_bridge_cond);
+        mono_os_mutex_unlock(&my_debug_lock);
 }
 
 static void
@@ -2180,6 +2204,14 @@ major_copy_or_mark_from_roots (SgenGrayQueue *gc_thread_gray_queue, size_t *old_
 		sgen_workers_set_num_active_workers (GENERATION_OLD, 1);
 		gray_queue_redirect (gc_thread_gray_queue);
 		if (precleaning_enabled) {
+
+
+                        mono_os_mutex_lock(&my_debug_lock);
+                        my_debug_can_leave_bridge = FALSE;
+                        printf("signaling bridge_cond (can_leave=FALSE)\n");
+                        mono_os_cond_broadcast(&my_debug_bridge_cond);
+                        mono_os_mutex_unlock(&my_debug_lock);
+
 			sgen_workers_start_all_workers (GENERATION_OLD, object_ops_nopar, object_ops_par, workers_finish_callback);
 		} else {
 			sgen_workers_start_all_workers (GENERATION_OLD, object_ops_nopar, object_ops_par, NULL);
@@ -3894,6 +3926,7 @@ sgen_gc_init (void)
 	gc_initialized = 1;
 
 	sgen_init_bridge ();
+	my_debug_init();
 }
 
 gboolean
